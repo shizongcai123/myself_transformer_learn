@@ -24,6 +24,16 @@ GPTLayer:       Self-Attn → Add&Norm → FFN → Add&Norm          ← 和 Enc
 唯一的区别：
     EncoderLayer 没有 Causal Mask（双向，能看所有位置）
     GPTLayer     有    Causal Mask（单向，只能看过去）
+
+【形状缩写约定（全文通用）】
+    B  = batch_size          （批大小，训练时=128）
+    S  = seq_len             （序列长度，含PAD）
+    D  = d_model             （嵌入维度，训练时=64）
+    H  = n_head              （注意力头数，训练时=4）
+    dk = d_k = D // H        （每头维度，训练时=16）
+    Ff = d_ff                （FFN中间维度，训练时=128）
+    V  = vocab_size          （词表大小=13）
+    P  = prompt_len          （prefill时prompt的长度）
 """
 
 import torch
@@ -38,17 +48,19 @@ import math
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_seq_len=200):
         super().__init__()
-        pe       = torch.zeros(max_seq_len, d_model)
-        position = torch.arange(0, max_seq_len).unsqueeze(1).float()
+        pe       = torch.zeros(max_seq_len, d_model)          # [max_seq_len, D]
+        position = torch.arange(0, max_seq_len).unsqueeze(1).float()  # [max_seq_len, 1]
         div_term = torch.exp(
             torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)
-        )
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe.unsqueeze(0))  # [1, max_seq_len, d_model]
+        )                                                      # [D/2]
+        pe[:, 0::2] = torch.sin(position * div_term)          # [max_seq_len, D/2]
+        pe[:, 1::2] = torch.cos(position * div_term)          # [max_seq_len, D/2]
+        self.register_buffer('pe', pe.unsqueeze(0))            # [1, max_seq_len, D]
 
     def forward(self, x):
-        # x: [batch, seq_len, d_model]
+        # x:              [B, S, D]
+        # pe[:, :S, :]:   [1, S, D]  → 广播加到每个样本
+        # 返回:           [B, S, D]
         return x + self.pe[:, :x.size(1), :]
 
 
@@ -61,31 +73,68 @@ class MultiHeadAttention(nn.Module):
         assert d_model % n_head == 0
         self.d_model = d_model
         self.n_head  = n_head
-        self.d_k     = d_model // n_head
+        self.d_k     = d_model // n_head   # dk = D/H
 
+        # 线性投影：D → D（内部等价于 H 个 dk 头并联）
         self.W_q = nn.Linear(d_model, d_model, bias=False)
         self.W_k = nn.Linear(d_model, d_model, bias=False)
         self.W_v = nn.Linear(d_model, d_model, bias=False)
         self.W_o = nn.Linear(d_model, d_model, bias=False)
 
     def forward(self, q, k, v, mask=None):
-        batch = q.size(0)
-        seq_q = q.size(1)
-        seq_k = k.size(1)
+        """
+        训练时全序列注意力（无 KV Cache）
 
+        输入:
+            q: [B, Sq, D]   Query 序列（自注意力时 Sq = S）
+            k: [B, Sk, D]   Key   序列（自注意力时 Sk = S）
+            v: [B, Sk, D]   Value 序列
+        """
+        batch = q.size(0)   # B
+        seq_q = q.size(1)   # Sq
+        seq_k = k.size(1)   # Sk
+
+        # ── 线性投影 + 拆分多头 ──────────────────────────────────
+        # W_q(q):  [B, Sq, D]
+        # .view:   [B, Sq, H, dk]   把 D 维拆成 H 个 dk 头
+        # .T(1,2): [B, H, Sq, dk]   把头维移到第2位，方便后续批矩阵乘
         Q = self.W_q(q).view(batch, seq_q, self.n_head, self.d_k).transpose(1, 2)
-        K = self.W_k(k).view(batch, seq_k, self.n_head, self.d_k).transpose(1, 2)
-        V = self.W_v(v).view(batch, seq_k, self.n_head, self.d_k).transpose(1, 2)
+        # Q: [B, H, Sq, dk]
 
+        K = self.W_k(k).view(batch, seq_k, self.n_head, self.d_k).transpose(1, 2)
+        # K: [B, H, Sk, dk]
+
+        V = self.W_v(v).view(batch, seq_k, self.n_head, self.d_k).transpose(1, 2)
+        # V: [B, H, Sk, dk]
+
+        # ── 注意力分数 ────────────────────────────────────────────
+        # K.T(-2,-1): [B, H, dk, Sk]
+        # Q @ K.T:    [B, H, Sq, dk] × [B, H, dk, Sk] = [B, H, Sq, Sk]
         scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
+        # scores: [B, H, Sq, Sk]   每个 query 位置对所有 key 位置的相关性得分
 
         if mask is not None:
+            # mask: [B, 1, Sq, Sk] 或 [1, 1, Sq, Sk]，广播到 [B, H, Sq, Sk]
             scores = scores.masked_fill(mask == 0, -1e9)
+            # 被 mask 的位置变成 -∞，softmax 后趋近 0
 
+        # ── Softmax 归一化 ────────────────────────────────────────
         attn_weights = F.softmax(scores, dim=-1)
+        # attn_weights: [B, H, Sq, Sk]   每行和为1，表示对 key 位置的注意力权重
+
+        # ── 加权求和 Value ─────────────────────────────────────────
+        # attn_weights @ V: [B, H, Sq, Sk] × [B, H, Sk, dk] = [B, H, Sq, dk]
         output = torch.matmul(attn_weights, V)
+        # output: [B, H, Sq, dk]
+
+        # ── 合并多头 + 输出投影 ────────────────────────────────────
+        # .T(1,2): [B, Sq, H, dk]
+        # .view:   [B, Sq, D]      H 个头拼回 D 维
         output = output.transpose(1, 2).contiguous().view(batch, seq_q, self.d_model)
+        # output: [B, Sq, D]
+
         return self.W_o(output)
+        # 返回: [B, Sq, D]
 
     def forward_prefill(self, q, k, v, mask=None):
         """
@@ -94,50 +143,90 @@ class MultiHeadAttention(nn.Module):
         与逐 token 的 forward_cached 不同，这里一次性处理整个 prompt，
         但必须加 causal mask 保证因果性（和训练时一致）。
 
-        返回: (output, K, V)
-            output: [batch, seq, d_model]
-            K, V:   [batch, n_head, seq, d_k]  直接作为后续 decode 的初始 cache
-        """
-        batch = q.size(0)
-        seq_q = q.size(1)
-        seq_k = k.size(1)
+        输入:
+            q, k, v: [B, P, D]   P = prompt_len
+            mask:    [1, 1, P, P]
 
+        返回: (output, K, V)
+            output: [B, P, D]
+            K, V:   [B, H, P, dk]   直接作为后续 decode 的初始 cache
+        """
+        batch = q.size(0)   # B
+        seq_q = q.size(1)   # P（prompt 长度）
+        seq_k = k.size(1)   # P
+
+        # 投影 + 拆头（过程同 forward，形状参考上面）
         Q = self.W_q(q).view(batch, seq_q, self.n_head, self.d_k).transpose(1, 2)
+        # Q: [B, H, P, dk]
         K = self.W_k(k).view(batch, seq_k, self.n_head, self.d_k).transpose(1, 2)
+        # K: [B, H, P, dk]   ← 这个 K 会被缓存
         V = self.W_v(v).view(batch, seq_k, self.n_head, self.d_k).transpose(1, 2)
+        # V: [B, H, P, dk]   ← 这个 V 会被缓存
 
         scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
+        # scores: [B, H, P, P]
+
         if mask is not None:
             scores = scores.masked_fill(mask == 0, -1e9)
+            # scores: [B, H, P, P]   上三角被置 -∞
 
         attn_weights = F.softmax(scores, dim=-1)
+        # attn_weights: [B, H, P, P]
+
         output = torch.matmul(attn_weights, V)
+        # output: [B, H, P, dk]
+
         output = output.transpose(1, 2).contiguous().view(batch, seq_q, self.d_model)
+        # output: [B, P, D]
+
         return self.W_o(output), K, V
+        # 返回: ([B, P, D], [B, H, P, dk], [B, H, P, dk])
 
     def forward_cached(self, q, cache_k, cache_v):
         """
-        KV Cache 版本（推理专用）
-        q:       [batch, 1, d_model]
-        cache_k: [batch, n_head, seq_so_far, d_k]
-        cache_v: [batch, n_head, seq_so_far, d_k]
+        KV Cache 版本（推理专用，每次只处理 1 个新 token）
+
+        输入:
+            q:       [B, 1, D]                  当前新 token 的嵌入
+            cache_k: [B, H, seq_so_far, dk]     历史所有 token 的 K
+            cache_v: [B, H, seq_so_far, dk]     历史所有 token 的 V
         """
-        batch = q.size(0)
+        batch = q.size(0)   # B
 
+        # 只对新 token 做投影（只算 1 个位置，不重算历史）
         Q     = self.W_q(q).view(batch, 1, self.n_head, self.d_k).transpose(1, 2)
+        # Q: [B, H, 1, dk]
+
         K_new = self.W_k(q).view(batch, 1, self.n_head, self.d_k).transpose(1, 2)
+        # K_new: [B, H, 1, dk]   新 token 的 K
+
         V_new = self.W_v(q).view(batch, 1, self.n_head, self.d_k).transpose(1, 2)
+        # V_new: [B, H, 1, dk]   新 token 的 V
 
-        # 追加新 token 的 K/V 到 cache
-        K = torch.cat([cache_k, K_new], dim=2)  # [batch, n_head, seq_so_far+1, d_k]
+        # 追加新 token 的 K/V 到 cache（沿 seq 维度拼接）
+        K = torch.cat([cache_k, K_new], dim=2)
+        # K: [B, H, seq_so_far+1, dk]   历史 K + 新 K
         V = torch.cat([cache_v, V_new], dim=2)
+        # V: [B, H, seq_so_far+1, dk]
 
+        # Q（1个位置）与全部历史 K 做注意力
+        # K.T(-2,-1): [B, H, dk, seq_so_far+1]
+        # Q @ K.T:    [B, H, 1, dk] × [B, H, dk, seq_so_far+1] = [B, H, 1, seq_so_far+1]
         scores       = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
-        attn_weights = F.softmax(scores, dim=-1)
-        output       = torch.matmul(attn_weights, V)
-        output       = output.transpose(1, 2).contiguous().view(batch, 1, self.d_model)
+        # scores: [B, H, 1, seq_so_far+1]   1个query 对所有历史位置的得分
 
-        return self.W_o(output), K, V  # 返回更新后的 K/V cache
+        attn_weights = F.softmax(scores, dim=-1)
+        # attn_weights: [B, H, 1, seq_so_far+1]
+
+        # attn_weights @ V: [B, H, 1, seq_so_far+1] × [B, H, seq_so_far+1, dk]
+        output       = torch.matmul(attn_weights, V)
+        # output: [B, H, 1, dk]
+
+        output       = output.transpose(1, 2).contiguous().view(batch, 1, self.d_model)
+        # output: [B, 1, D]
+
+        return self.W_o(output), K, V
+        # 返回: ([B, 1, D], [B, H, seq_so_far+1, dk], [B, H, seq_so_far+1, dk])
 
 
 # ======================================================================
@@ -150,7 +239,12 @@ class FeedForward(nn.Module):
         self.linear2 = nn.Linear(d_ff, d_model)
 
     def forward(self, x):
+        # x:          [B, S, D]
+        # linear1(x): [B, S, D] → [B, S, Ff]   升维（Ff=128，D=64的2倍）
+        # relu:       [B, S, Ff]                非线性激活
+        # linear2:    [B, S, Ff] → [B, S, D]   降回 D 维
         return self.linear2(F.relu(self.linear1(x)))
+        # 返回: [B, S, D]
 
 
 # ======================================================================
@@ -179,52 +273,82 @@ class GPTLayer(nn.Module):
 
     def forward(self, x, mask):
         """
-        x:    [batch, seq_len, d_model]
-        mask: [batch, 1, seq_len, seq_len]  Causal Mask（下三角）
+        训练时全序列前向（带 Causal Mask）
+
+        x:    [B, S, D]
+        mask: [B, 1, S, S]  Causal Mask（下三角，含PAD屏蔽）
 
         Causal Mask 保证位置 i 只能看 0..i，
         这使得每个位置都能用来预测"下一个 token"。
         """
-        # Self-Attention + 残差 + 归一化
+        # ── Self-Attention ────────────────────────────────────────
         attn_out = self.self_attn(q=x, k=x, v=x, mask=mask)
-        x = self.norm1(x + self.dropout(attn_out))  # [batch, seq_len, d_model]
+        # attn_out: [B, S, D]
 
-        # FFN + 残差 + 归一化
+        # ── 残差连接 + 层归一化 ───────────────────────────────────
+        x = self.norm1(x + self.dropout(attn_out))
+        # x: [B, S, D]
+
+        # ── FFN ──────────────────────────────────────────────────
         ffn_out = self.ffn(x)
-        x = self.norm2(x + self.dropout(ffn_out))   # [batch, seq_len, d_model]
+        # ffn_out: [B, S, D]
+
+        x = self.norm2(x + self.dropout(ffn_out))
+        # x: [B, S, D]
 
         return x
+        # 返回: [B, S, D]
 
     def forward_prefill(self, x, mask):
         """
         Prefill 专用：一次性处理整个 prompt，返回输出和 KV cache。
 
-        x:    [batch, seq_len, d_model]
-        mask: [1, 1, seq_len, seq_len]  Causal Mask
+        x:    [B, P, D]
+        mask: [1, 1, P, P]  Causal Mask
 
         返回: (output, K, V)
-            output: [batch, seq_len, d_model]
-            K, V:   [batch, n_head, seq_len, d_k]  作为后续 decode 的初始 cache
+            output: [B, P, D]
+            K, V:   [B, H, P, dk]  作为后续 decode 的初始 cache
         """
         attn_out, K, V = self.self_attn.forward_prefill(q=x, k=x, v=x, mask=mask)
+        # attn_out: [B, P, D]
+        # K: [B, H, P, dk]
+        # V: [B, H, P, dk]
+
         x = self.norm1(x + self.dropout(attn_out))
+        # x: [B, P, D]
+
         ffn_out = self.ffn(x)
+        # ffn_out: [B, P, D]
+
         x = self.norm2(x + self.dropout(ffn_out))
+        # x: [B, P, D]
+
         return x, K, V
+        # 返回: ([B, P, D], [B, H, P, dk], [B, H, P, dk])
 
     def forward_cached(self, x, cache_k, cache_v):
         """
         KV Cache 版本（推理专用，每次只处理 1 个新 token）
 
-        x:       [batch, 1, d_model]
-        cache_k: [batch, n_head, seq_so_far, d_k]
-        cache_v: [batch, n_head, seq_so_far, d_k]
+        x:       [B, 1, D]
+        cache_k: [B, H, seq_so_far, dk]
+        cache_v: [B, H, seq_so_far, dk]
         """
-        # 推理时不需要 mask（cache 里只有历史，没有未来）
         attn_out, new_k, new_v = self.self_attn.forward_cached(x, cache_k, cache_v)
+        # attn_out: [B, 1, D]
+        # new_k:    [B, H, seq_so_far+1, dk]   已包含新 token 的 K
+        # new_v:    [B, H, seq_so_far+1, dk]
+
         x = self.norm1(x + attn_out)
+        # x: [B, 1, D]
+
         x = self.norm2(x + self.ffn(x))
+        # ffn(x): [B, 1, D]
+        # x:      [B, 1, D]
+
         return x, new_k, new_v
+        # 返回: ([B, 1, D], [B, H, seq_so_far+1, dk], [B, H, seq_so_far+1, dk])
 
 
 # ======================================================================
@@ -256,39 +380,49 @@ class DecoderOnlyTransformer(nn.Module):
         self.d_model    = d_model
         self.num_layers = num_layers
 
-        # 词嵌入
         self.embedding    = nn.Embedding(vocab_size, d_model, padding_idx=0)
+        # Embedding 表: [V, D]，把每个 token id 映射到 D 维向量
         self.pos_encoding = PositionalEncoding(d_model, max_seq_len)
 
-        # N 个 GPTLayer 堆叠（没有 EncoderLayer，没有 Cross-Attention）
         self.layers = nn.ModuleList([
             GPTLayer(d_model, n_head, d_ff, dropout) for _ in range(num_layers)
         ])
+        # num_layers 个 GPTLayer 串联，每层输入输出均为 [B, S, D]
 
-        # 输出层
         self.fc_out = nn.Linear(d_model, vocab_size)
+        # 输出投影: D → V，用于预测下一个 token 的概率分布
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, mask=None):
         """
         训练时的前向传播
 
-        x:    [batch, seq_len]  整个序列（prompt + 生成内容）的 token id
-        mask: [batch, 1, seq_len, seq_len]  Causal Mask
+        x:    [B, S]   整个序列的 token id（prompt + 答案，已去掉最后一个 EOS）
+        mask: [B, 1, S, S]  Causal Mask + PAD Mask
 
-        返回: logits [batch, seq_len, vocab_size]
-              每个位置对"下一个 token"的预测分布
+        返回: logits [B, S, V]   每个位置对"下一个 token"的预测分布
         """
-        # 词嵌入 + 位置编码
-        x = self.embedding(x) * math.sqrt(self.d_model)  # [batch, seq_len, d_model]
-        x = self.dropout(self.pos_encoding(x))
+        # ── 词嵌入 ────────────────────────────────────────────────
+        x = self.embedding(x)
+        # embedding(x): [B, S] → [B, S, D]   查表，每个 token id 换成 D 维向量
 
-        # 依次通过每个 GPTLayer
+        x = x * math.sqrt(self.d_model)
+        # x: [B, S, D]   乘以 √D 防止嵌入值过小，稳定梯度
+
+        x = self.dropout(self.pos_encoding(x))
+        # pos_encoding: [B, S, D] + [1, S, D] = [B, S, D]   加入位置信息
+        # dropout 后:   [B, S, D]
+
+        # ── 依次通过每个 GPTLayer ─────────────────────────────────
         for layer in self.layers:
             x = layer(x, mask)
+            # 每层输入输出均为 [B, S, D]
+            # 共 num_layers 层（训练时=2层）
 
-        # 输出层：每个位置预测下一个 token
-        return self.fc_out(x)  # [batch, seq_len, vocab_size]
+        # ── 输出投影 ──────────────────────────────────────────────
+        return self.fc_out(x)
+        # fc_out: [B, S, D] → [B, S, V]
+        # 每个序列位置输出 V=13 维的 logits，表示"下一个 token"的未归一化概率
 
     def prefill(self, prompt_tokens):
         """
@@ -302,52 +436,60 @@ class DecoderOnlyTransformer(nn.Module):
             模型训练时用了 causal mask（位置 i 只能看 0..i），
             推理时必须保持一致，否则计算出的 KV 和训练时不同，生成就会出错。
 
-        prompt_tokens: [batch, prompt_len]  prompt 的 token id
+        prompt_tokens: [B, P]  prompt 的 token id（B 通常=1，推理时单样本）
         返回:
-            logits: [batch, vocab_size]  最后一个位置的预测（用于生成第一个新 token）
+            logits: [B, V]    最后一个位置的预测（用于生成第一个新 token）
             cache:  list，每层一个 (K, V) 元组
-                    K, V: [batch, n_head, prompt_len, d_k]
+                    K, V: [B, H, P, dk]
         """
-        seq_len = prompt_tokens.size(1)
+        seq_len = prompt_tokens.size(1)   # P
         device  = prompt_tokens.device
 
-        # 词嵌入 + 位置编码
+        # ── 词嵌入 + 位置编码 ─────────────────────────────────────
         x = self.embedding(prompt_tokens) * math.sqrt(self.d_model)
-        x = self.dropout(self.pos_encoding(x))  # [batch, prompt_len, d_model]
+        # x: [B, P, D]
 
-        # Causal Mask：和训练时一样的下三角矩阵
-        # [1, 1, prompt_len, prompt_len]
+        x = self.dropout(self.pos_encoding(x))
+        # x: [B, P, D]
+
+        # ── Causal Mask（和训练完全一致的下三角矩阵）────────────────
         mask = make_causal_mask(seq_len, device)
+        # mask: [1, 1, P, P]   下三角为1，上三角为0
 
-        # 依次通过每层，收集 KV Cache
+        # ── 依次通过每层，收集各层的 KV Cache ─────────────────────
         cache = []
         for layer in self.layers:
             x, K, V = layer.forward_prefill(x, mask)
+            # x: [B, P, D]
+            # K: [B, H, P, dk]   ← 该层对 prompt 所有位置计算的 K，缓存备用
+            # V: [B, H, P, dk]   ← 该层对 prompt 所有位置计算的 V，缓存备用
             cache.append((K, V))
-            # K, V: [batch, n_head, prompt_len, d_k]
-            # 直接作为后续 decode_one_step 的初始 cache
 
-        # 只取最后一个位置的 logits（预测 prompt 之后的第一个 token）
-        logits = self.fc_out(x[:, -1, :])  # [batch, vocab_size]
+        # ── 取最后一个 prompt token 的 logits ─────────────────────
+        # x[:, -1, :]: [B, D]   只要最后一个位置（SEP 位置）的输出
+        logits = self.fc_out(x[:, -1, :])
+        # logits: [B, V]   预测 prompt 后第一个 token 的分布
 
         return logits, cache
+        # 返回: ([B, V], list of (K[B,H,P,dk], V[B,H,P,dk]) × num_layers)
 
     def build_cache(self, device, batch_size=1):
         """
-        初始化空的 KV Cache（推理前调用）
+        初始化空的 KV Cache（推理前调用，如不使用 prefill）
 
         Decoder-Only 的 cache 比 Encoder-Decoder 简单：
         只有自注意力的 K/V，没有交叉注意力的 K/V。
 
-        返回: cache，list，每层一个 (k, v) 元组，初始为空
+        返回: cache，list，每层一个 (k, v) 元组，初始为空（seq_so_far=0）
         """
         cache = []
         for layer in self.layers:
             n_head = layer.self_attn.n_head
             d_k    = layer.self_attn.d_k
-            # 空的 cache：seq_so_far=0
             empty_k = torch.zeros(batch_size, n_head, 0, d_k, device=device)
+            # empty_k: [B, H, 0, dk]   seq 维为 0，尚无历史
             empty_v = torch.zeros(batch_size, n_head, 0, d_k, device=device)
+            # empty_v: [B, H, 0, dk]
             cache.append((empty_k, empty_v))
         return cache
 
@@ -355,28 +497,44 @@ class DecoderOnlyTransformer(nn.Module):
         """
         推理时单步解码（带 KV Cache）
 
-        token_id: [batch]  当前 token 的 id
-        pos:      int       当前位置（用于取位置编码）
-        cache:    list      各层的 (cache_k, cache_v)
+        token_id: [B]    当前 token 的 id（上一步预测出的 token）
+        pos:      int    当前位置（用于取正确的位置编码）
+        cache:    list   各层的 (cache_k, cache_v)
 
         返回:
-            logits:    [batch, vocab_size]
-            new_cache: 更新后的 cache
+            logits:    [B, V]
+            new_cache: 更新后的 cache（每层 seq 维度+1）
         """
-        # 词嵌入 + 位置编码（只处理 1 个 token）
+        # ── 词嵌入 + 位置编码（只处理 1 个新 token）──────────────
         x = self.embedding(token_id.unsqueeze(1)) * math.sqrt(self.d_model)
-        x = x + self.pos_encoding.pe[:, pos:pos + 1, :]  # [batch, 1, d_model]
+        # token_id.unsqueeze(1): [B] → [B, 1]
+        # embedding:             [B, 1] → [B, 1, D]
+        # × √D:                  [B, 1, D]
 
+        x = x + self.pos_encoding.pe[:, pos:pos + 1, :]
+        # pe[:, pos:pos+1, :]: [1, 1, D]   取第 pos 个位置的编码
+        # x: [B, 1, D]
+
+        # ── 依次通过每层，更新 KV Cache ──────────────────────────
         new_cache = []
         for i, layer in enumerate(self.layers):
             cache_k, cache_v = cache[i]
+            # cache_k: [B, H, seq_so_far, dk]
+            # cache_v: [B, H, seq_so_far, dk]
+
             x, new_k, new_v  = layer.forward_cached(x, cache_k, cache_v)
+            # x:     [B, 1, D]
+            # new_k: [B, H, seq_so_far+1, dk]   追加了当前 token 的 K
+            # new_v: [B, H, seq_so_far+1, dk]
             new_cache.append((new_k, new_v))
 
-        # 取最后一个 token 的输出，预测下一个
-        logits = self.fc_out(x[:, 0, :])  # [batch, vocab_size]
+        # ── 输出投影（只取 seq=0 这个唯一位置）──────────────────
+        logits = self.fc_out(x[:, 0, :])
+        # x[:, 0, :]: [B, D]   squeeze 掉 seq=1 这一维
+        # logits:     [B, V]   预测下一个 token 的分布
 
         return logits, new_cache
+        # 返回: ([B, V], list of (K[B,H,seq_so_far+1,dk], V[B,H,seq_so_far+1,dk]) × num_layers)
 
 
 # ======================================================================
@@ -384,12 +542,22 @@ class DecoderOnlyTransformer(nn.Module):
 # ======================================================================
 def make_causal_mask(seq_len, device):
     """
-    纯 Causal Mask（推理时使用，无 PAD）
+    纯 Causal Mask（推理 prefill 时使用，无 PAD）
 
-    返回: [1, 1, seq_len, seq_len]
+    torch.tril: 保留下三角（含对角线），上三角置0
+    例如 seq_len=4：
+        [[1, 0, 0, 0],
+         [1, 1, 0, 0],
+         [1, 1, 1, 0],
+         [1, 1, 1, 1]]
+
+    返回: [1, 1, seq_len, seq_len]   前两个1是 batch 和 head 的广播维
     """
     mask = torch.tril(torch.ones(seq_len, seq_len, device=device))
+    # mask: [seq_len, seq_len]
+
     return mask.unsqueeze(0).unsqueeze(0)
+    # 返回: [1, 1, seq_len, seq_len]
 
 
 def make_mask(seq, pad_idx=0):
@@ -411,19 +579,27 @@ def make_mask(seq, pad_idx=0):
             PAD [  0,  0,  0,  0,  0 ]   PAD行全屏蔽（pad mask）
             PAD [  0,  0,  0,  0,  0 ]   PAD行全屏蔽（pad mask）
 
-    seq:  [batch, seq_len]
-    返回: [batch, 1, seq_len, seq_len]
+    seq:  [B, S]
+    返回: [B, 1, S, S]
     """
-    seq_len = seq.size(1)
+    seq_len = seq.size(1)   # S
     device  = seq.device
 
-    # PAD Mask: PAD 位置为 0，其他为 1
-    # [batch, 1, 1, seq_len] 广播到 [batch, 1, seq_len, seq_len]（屏蔽整行）
+    # ── PAD Mask ──────────────────────────────────────────────────
+    # (seq != pad_idx):          [B, S]      非PAD位置为True
+    # .unsqueeze(1).unsqueeze(2):[B, 1, 1, S]
+    # 广播到 [B, 1, S, S]：屏蔽整行（某行的 query 是PAD时全行置0）
     pad_mask = (seq != pad_idx).unsqueeze(1).unsqueeze(2)
+    # pad_mask: [B, 1, 1, S]
 
-    # Causal Mask: 下三角矩阵
-    # [1, 1, seq_len, seq_len]
+    # ── Causal Mask ───────────────────────────────────────────────
     causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=device)).unsqueeze(0).unsqueeze(0)
+    # tril:       [S, S]
+    # unsqueeze×2:[1, 1, S, S]
 
-    # 两者取交集
-    return pad_mask & causal_mask.bool()  # [batch, 1, seq_len, seq_len]
+    # ── 两者取交集 ────────────────────────────────────────────────
+    # pad_mask:   [B, 1, 1, S]   广播
+    # causal_mask:[1, 1, S, S]   广播
+    # &:          [B, 1, S, S]
+    return pad_mask & causal_mask.bool()
+    # 返回: [B, 1, S, S]   每个样本独立的 mask
